@@ -5,24 +5,20 @@ import { EVENTS } from '../src/constants.js';
 import adapter from '../libraries/analyticsAdapter/AnalyticsAdapter.js';
 import adapterManager from '../src/adapterManager.js';
 import { logMessage } from '../src/utils.js';
-
-// Object.entries polyfill
-const entries = Object.entries || function(obj) {
-  const ownProps = Object.keys(obj);
-  let i = ownProps.length;
-  let resArray = new Array(i); // preallocate the Array
-  while (i--) { resArray[i] = [ownProps[i], obj[ownProps[i]]]; }
-
-  return resArray;
-};
+import { getAuctionMetadata } from '../libraries/scaleableUtils/scaleableUtils.js';
 
 const BID_TIMEOUT = EVENTS.BID_TIMEOUT;
 const AUCTION_INIT = EVENTS.AUCTION_INIT;
+const BID_REQUESTED = EVENTS.BID_REQUESTED;
+const BID_RESPONSE = EVENTS.BID_RESPONSE;
 const BID_WON = EVENTS.BID_WON;
 const AUCTION_END = EVENTS.AUCTION_END;
 
-const URL = 'https://auction.scaleable.ai/';
+const URL = 'http://localhost:8061/api/track/auction';
+// const URL = 'https://auction.scaleable.ai/';
 const ANALYTICS_TYPE = 'endpoint';
+const FLUSH_TIMEOUT = 2100;
+const TIMEOUT_REFS = {};
 
 let auctionData = {};
 
@@ -43,6 +39,12 @@ let scaleableAnalytics = Object.assign({},
           break;
         case BID_WON:
           onBidWon(args);
+          break;
+        case BID_REQUESTED:
+          onBidRequested(args);
+          break;
+        case BID_RESPONSE:
+          onBidResponse(args);
           break;
         case BID_TIMEOUT:
           onBidTimeout(args);
@@ -70,128 +72,229 @@ scaleableAnalytics.getAuctionData = () => {
   return auctionData;
 };
 
+const finalizeAuction = (auctionId, timeoutReached) => {
+  const auction = auctionData[auctionId];
+  if (!auction || auction._flushed) {
+    // TODO: Log Error if auction is undefined
+    return;
+  }
+
+  auction.timeoutReached = !!timeoutReached;
+  auction._flushed = true;
+
+  sendDataToServer(auction);
+};
+
 const sendDataToServer = data => ajax(URL, () => {}, JSON.stringify(data));
+
+// Event Tracking
 
 // Track auction initiated
 const onAuctionInit = args => {
-  const config = scaleableAnalytics.config || {options: {}};
+  const scaleableConfig = scaleableAnalytics.config || {options: {}};
+  const {adUnits, auctionId, bidderRequests, timestamp} = args;
 
-  let adunitObj = {};
-  let adunits = [];
+  // Set Initial data for this auction
+  auctionData[auctionId] = {
+    auctionId,
+    startTime: timestamp,
+    status: 'started',
+    site: scaleableConfig.options.site,
+    adUnits: {},
+    metadata: getAuctionMetadata()
+  };
 
-  // Loop through adunit codes first
-  args.adUnitCodes.forEach((code) => {
-    adunitObj[code] = [{
-      bidder: 'scaleable_adunit_request'
-    }]
+  const auction = auctionData[auctionId];
+
+  // Loop through ad units to fill the adUnits on the auction
+  adUnits.forEach(adUnit => {
+    const mediaTypes = Object.keys(adUnit.mediaTypes);
+
+    auction.adUnits[adUnit.code] = {
+      mediaTypes,
+      bids: []
+    }
   });
 
-  // Loop through bidder requests and bids
-  args.bidderRequests.forEach((bidderObj) => {
-    bidderObj.bids.forEach((bidObj) => {
-      adunitObj[bidObj.adUnitCode].push({
-        bidder: bidObj.bidder,
-        params: bidObj.params
+  // Loop through bidder requests
+  bidderRequests.forEach((bidder) => {
+    // Loop through all the bids of this bidder
+    bidder.bids.forEach((bid) => {
+      const {adUnitCode, bidder, params, requestId} = bid;
+      const adUnit = auction.adUnits[adUnitCode];
+
+      if (!adUnit) {
+        // TODO: Log an error since we already added all the ad units
+        return;
+      }
+
+      // Set Data for this bidder and the adunit
+      adUnit.bids.push({
+        bidder,
+        params,
+        requestId
       })
     });
   });
-
-  entries(adunitObj).forEach(([adunitCode, bidRequests]) => {
-    adunits.push({
-      code: adunitCode,
-      bidRequests: bidRequests
-    });
-  });
-
-  const data = {
-    event: 'request',
-    site: config.options.site,
-    adunits: adunits
-  }
-
-  sendDataToServer(data);
 }
 
-// Handle all events besides requests and wins
-const onAuctionEnd = args => {
-  const config = scaleableAnalytics.config || {options: {}};
-
-  let adunitObj = {};
-  let adunits = [];
-
-  // Add Bids Received
-  args.bidsReceived.forEach((bidObj) => {
-    if (!adunitObj[bidObj.adUnitCode]) { adunitObj[bidObj.adUnitCode] = []; }
-
-    adunitObj[bidObj.adUnitCode].push({
-      bidder: bidObj.bidderCode || bidObj.bidder,
-      cpm: bidObj.cpm,
-      currency: bidObj.currency,
-      dealId: bidObj.dealId,
-      type: bidObj.mediaType,
-      ttr: bidObj.timeToRespond,
-      size: bidObj.size
-    });
-  });
-
-  // Add in other data (timeouts) as we push to adunits
-  entries(adunitObj).forEach(([adunitCode, bidsReceived]) => {
-    const bidData = bidsReceived.concat(auctionData[adunitCode] || []);
-    adunits.push({
-      code: adunitCode,
-      bidData: bidData
-    });
-
-    delete auctionData[adunitCode];
-  });
-
-  // Add in any missed auction data
-  entries(auctionData).forEach(([adunitCode, bidData]) => {
-    adunits.push({
-      code: adunitCode,
-      bidData: bidData
-    })
-  });
-
-  const data = {
-    event: 'bids',
-    site: config.options.site,
-    adunits: adunits
-  }
-
-  if (adunits.length) { sendDataToServer(data); }
-
-  // Reset auctionData
-  auctionData = {}
-}
-
-// Bid Win Events occur after auction end
-const onBidWon = args => {
-  const config = scaleableAnalytics.config || {options: {}};
-
-  const data = {
-    event: 'win',
-    site: config.options.site,
-    adunit: args.adUnitCode,
-    code: args.bidderCode,
-    cpm: args.cpm,
-    ttr: args.timeToRespond,
-    params: args.params
-  };
-
-  sendDataToServer(data);
-}
-
-const onBidTimeout = args => {
-  args.forEach(currObj => {
-    if (!auctionData[currObj.adUnitCode]) {
-      auctionData[currObj.adUnitCode] = []
+const onBidRequested = ({auctionId, bids}) => {
+  bids.forEach(bid => {
+    const adUnit = auctionData[auctionId].adUnits[bid.adUnitCode];
+    if (!adUnit) {
+      // TODO: LOG warning
+      return;
     }
 
-    auctionData[currObj.adUnitCode].push({
-      timeouts: 1,
-      bidder: currObj.bidder
-    });
+    let existingBid = adUnit.bids.find(b => b.requestId === bid.requestId);
+
+    // Set properties for each bid (which should always exist)
+    if (existingBid) {
+      existingBid = {
+        ...existingBid,
+        isS2S: bid.src === 's2s',
+        alias: bid.bidderCode !== bid.bidder ? bid.bidderCode : null,
+        size: Array.isArray(bid.sizes) ? bid.sizes : [],
+        timeRequested: Date.now(),
+        status: 'requested'
+      }
+    }
+  });
+};
+
+const onBidResponse = bid => {
+  const { cpm, currency, netRevenue, creativeId, timeToRespond, width, height,
+    ttl, mediaType, dealId, adId, floorData, originalCpm} = bid;
+  const adUnit = auctionData[auctionId].adUnits[bid.adUnitCode];
+  if (!adUnit) {
+    // TODO: LOG warning
+    return;
+  }
+
+  let existingBid = adUnit.bids.find(b => b.requestId === bid.requestId);
+
+  // Set properties for each bid (which should always exist)
+  if (!existingBid) {
+    // TODO: LOG Error
+    return;
+  }
+  
+
+  existingBid = {
+    ...existingBid,
+    cpm,
+    originalCpm,
+    currency,
+    netRevenue,
+    creativeId,
+    ttr: timeToRespond,
+    width,
+    height,
+    ttl,
+    mediaType,
+    dealId,
+    adId,
+    status: 'responded',
+    floorData
+  };
+};
+
+// Handle all events besides requests and wins
+const onAuctionEnd = auctionDetails => {
+  const {auctionId, timeout} = auctionDetails;
+  if (!auctionData[auctionId]) {
+    // TODO: Log Error
+    return;
+  }
+
+  // Set a few more attributes on the auction itself
+  auctionData[auctionId].endTime = Date.now();
+  auctionData[auctionId].timeout = timeout;
+  auctionData[auctionId].status = 'ended';
+
+  const adUnitCodes = Object.keys(auctionData[auctionId].adUnits);
+  const wonAdUnitCodes = new Set();
+
+  const checkAndFlush = () => {
+    const allDone = adUnitCodes.every(code => wonAdUnitCodes.has(code));
+    if (allDone) {
+      finalizeAuction(auctionId);
+      clearTimeout(TIMEOUT_REFS[auctionId]);
+    }
+  };
+
+  // Only wait 2 seconds for Bid Won events
+  TIMEOUT_REFS[auctionId] = setTimeout(() => {
+    finalizeAuction(auctionId, true);
+  }, FLUSH_TIMEOUT);
+
+  // Set a function on auction for when Bid Won events come back to see if we can flush early
+  auctionData[auctionId]._onBidWon = (adUnitCode) => {
+    wonAdUnitCodes.add(adUnitCode);
+    checkAndFlush();
+  }
+};
+
+// Bid Win Events occur after auction end
+const onBidWon = bid => {
+  const auction = auctionData[auctionId];
+  if (auction._flushed) {
+    // TODO: Call endpoint to record missed WINs
+  }
+
+  const adUnit = auction.adUnits[bid.adUnitCode];
+  if (!adUnit) {
+    // TODO: LOG warning
+    return;
+  }
+
+  let existingBid = adUnit.bids.find(b => b.requestId === bid.requestId);
+
+  // Set properties for each bid (which should always exist)
+  if (!existingBid) {
+    // TODO: LOG Error
+    return;
+  }
+
+  existingBid = {
+    ...existingBid,
+    status: 'won',
+    floorData: bid.floorData || existingBid.floorData,
+    dealId: bid.dealId || existingBid.dealId,
+    adServerTargeting: {
+      hb_pb: bid.adServerTargeting.hb_pb,
+      hb_bidder: bid.adServerTargeting.hb_bidder,
+      hb_deal: bid.adServerTargeting.hb_deal
+    }
+  };
+
+  // If auction has ended, check if we can flush events
+  if (auction._onBidWon) {
+    auction._onBidWon(bid.adUnitCode)
+  }
+}
+
+const onBidTimeout = timeouts => {
+  timeouts.forEach(timeout => {
+    const adUnit = auctionData[timeout.auctionId].adUnits[timeout.adUnitCode];
+    if (!adUnit) {
+      // TODO: LOG warning
+      return;
+    }
+
+    let existingBid = adUnit.bids.find(b => b.requestId === timeout.requestId);
+
+    // Set properties for each bid (which should always exist)
+    if (!existingBid) {
+      // TODO: LOG Error
+      return;
+    }
+
+    existingBid = {
+      ...existingBid,
+      timeout: timeout.timeout,
+      status: 'timeout'
+    }
   });
 }
 
