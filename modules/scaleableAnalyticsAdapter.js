@@ -92,7 +92,7 @@ const sendDataToServer = data => ajax(URL, () => {}, JSON.stringify(data));
 // Track auction initiated
 const onAuctionInit = args => {
   const scaleableConfig = scaleableAnalytics.config || {options: {}};
-  const {adUnits, auctionId, bidderRequests, timestamp} = args;
+  const {adUnits, auctionId, bidderRequests, timestamp, timeout} = args;
 
   // Set Initial data for this auction
   auctionData[auctionId] = {
@@ -101,7 +101,8 @@ const onAuctionInit = args => {
     status: 'started',
     site: scaleableConfig.options.site,
     adUnits: {},
-    metadata: getAuctionMetadata()
+    metadata: getAuctionMetadata(),
+    timeout
   };
 
   const auction = auctionData[auctionId];
@@ -120,7 +121,7 @@ const onAuctionInit = args => {
   bidderRequests.forEach((bidder) => {
     // Loop through all the bids of this bidder
     bidder.bids.forEach((bid) => {
-      const {adUnitCode, bidder, params, requestId} = bid;
+      const {adUnitCode, bidder, params, bidId} = bid;
       const adUnit = auction.adUnits[adUnitCode];
 
       if (!adUnit) {
@@ -132,7 +133,7 @@ const onAuctionInit = args => {
       adUnit.bids.push({
         bidder,
         params,
-        requestId
+        requestId: bidId
       })
     });
   });
@@ -146,24 +147,21 @@ const onBidRequested = ({auctionId, bids}) => {
       return;
     }
 
-    let existingBid = adUnit.bids.find(b => b.requestId === bid.requestId);
+    let existingBid = adUnit.bids.find(b => (b.requestId === bid.requestId) || (b.requestId === bid.bidId));
 
     // Set properties for each bid (which should always exist)
     if (existingBid) {
-      existingBid = {
-        ...existingBid,
-        isS2S: bid.src === 's2s',
-        alias: bid.bidderCode !== bid.bidder ? bid.bidderCode : null,
-        size: Array.isArray(bid.sizes) ? bid.sizes : [],
-        timeRequested: Date.now(),
-        status: 'requested'
-      }
+      existingBid.isS2S = bid.src === 's2s';
+      existingBid.alias = bid.bidderCode && (bid.bidderCode !== bid.bidder) ? bid.bidderCode : null;
+      existingBid.size = Array.isArray(bid.sizes) ? bid.sizes : [];
+      existingBid.timeRequested = Date.now();
+      existingBid.status = 'requested';
     }
   });
 };
 
 const onBidResponse = bid => {
-  const { cpm, currency, netRevenue, creativeId, timeToRespond, width, height,
+  const { auctionId, cpm, currency, netRevenue, creativeId, timeToRespond, width, height,
     ttl, mediaType, dealId, adId, floorData, originalCpm} = bid;
   const adUnit = auctionData[auctionId].adUnits[bid.adUnitCode];
   if (!adUnit) {
@@ -171,32 +169,28 @@ const onBidResponse = bid => {
     return;
   }
 
-  let existingBid = adUnit.bids.find(b => b.requestId === bid.requestId);
+  let existingBid = adUnit.bids.find(b => (b.requestId === bid.requestId) || (b.requestId === bid.bidId));
 
   // Set properties for each bid (which should always exist)
   if (!existingBid) {
     // TODO: LOG Error
     return;
   }
-  
 
-  existingBid = {
-    ...existingBid,
-    cpm,
-    originalCpm,
-    currency,
-    netRevenue,
-    creativeId,
-    ttr: timeToRespond,
-    width,
-    height,
-    ttl,
-    mediaType,
-    dealId,
-    adId,
-    status: 'responded',
-    floorData
-  };
+  existingBid.cpm = cpm;
+  existingBid.originalCpm = originalCpm;
+  existingBid.currency = currency;
+  existingBid.netRevenue = netRevenue;
+  existingBid.creativeId = creativeId;
+  existingBid.ttr = timeToRespond;
+  existingBid.width = width;
+  existingBid.height = height;
+  existingBid.ttl = ttl;
+  existingBid.mediaType = mediaType;
+  existingBid.dealId = dealId || null;
+  existingBid.adId = adId;
+  existingBid.status = 'responded';
+  existingBid.floorData = floorData || null;
 };
 
 // Handle all events besides requests and wins
@@ -237,18 +231,20 @@ const onAuctionEnd = auctionDetails => {
 
 // Bid Win Events occur after auction end
 const onBidWon = bid => {
+  const {auctionId, adserverTargeting, adUnitCode, bidId, dealId, floorData, requestId} = bid;
   const auction = auctionData[auctionId];
   if (auction._flushed) {
     // TODO: Call endpoint to record missed WINs
+    return;
   }
 
-  const adUnit = auction.adUnits[bid.adUnitCode];
+  const adUnit = auction.adUnits[adUnitCode];
   if (!adUnit) {
     // TODO: LOG warning
     return;
   }
 
-  let existingBid = adUnit.bids.find(b => b.requestId === bid.requestId);
+  let existingBid = adUnit.bids.find(b => (b.requestId === requestId) || (b.requestId === bidId));
 
   // Set properties for each bid (which should always exist)
   if (!existingBid) {
@@ -256,17 +252,16 @@ const onBidWon = bid => {
     return;
   }
 
-  existingBid = {
-    ...existingBid,
-    status: 'won',
-    floorData: bid.floorData || existingBid.floorData,
-    dealId: bid.dealId || existingBid.dealId,
-    adServerTargeting: {
-      hb_pb: bid.adServerTargeting.hb_pb,
-      hb_bidder: bid.adServerTargeting.hb_bidder,
-      hb_deal: bid.adServerTargeting.hb_deal
-    }
-  };
+  existingBid.status = 'won';
+  existingBid.floorData = floorData || existingBid.floorData;
+  existingBid.dealId = dealId || existingBid.dealId;
+  if (adserverTargeting) {
+    existingBid.adserverTargeting = {
+      hb_pb: adserverTargeting.hb_pb || null,
+      hb_bidder: adserverTargeting.hb_bidder || null,
+      hb_deal: adserverTargeting.hb_deal || null
+    };
+  }
 
   // If auction has ended, check if we can flush events
   if (auction._onBidWon) {
@@ -282,7 +277,7 @@ const onBidTimeout = timeouts => {
       return;
     }
 
-    let existingBid = adUnit.bids.find(b => b.requestId === timeout.requestId);
+    let existingBid = adUnit.bids.find(b => (b.requestId === timeout.requestId) || (b.requestId === timeout.bidId));
 
     // Set properties for each bid (which should always exist)
     if (!existingBid) {
@@ -290,11 +285,8 @@ const onBidTimeout = timeouts => {
       return;
     }
 
-    existingBid = {
-      ...existingBid,
-      timeout: timeout.timeout,
-      status: 'timeout'
-    }
+    existingBid.timeout = timeout.timeout || null;
+    existingBid.status = 'timeout';
   });
 }
 
