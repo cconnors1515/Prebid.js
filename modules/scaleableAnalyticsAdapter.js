@@ -85,7 +85,7 @@ const finalizeAuction = (auctionId, timeoutReached) => {
   sendDataToServer(auction);
 };
 
-const sendDataToServer = data => ajax(URL, () => {}, JSON.stringify(data));
+const sendDataToServer = data => ajax(URL, () => {}, JSON.stringify(data), {contentType: 'application/json'});
 
 // Event Tracking
 
